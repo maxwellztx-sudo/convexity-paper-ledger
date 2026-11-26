@@ -1,0 +1,33 @@
+{
+  "initialized": true,
+  "start_date": "2026-11-26",
+  "initial_capital": "100000",
+  "last_date": "2026-11-26",
+  "last_funding_ms": 1795669200025,
+  "cash": "99989.3794151972500",
+  "positions": {
+    "BTC": {
+      "szi": "-0.43718",
+      "entry_px": "60764.0"
+    }
+  },
+  "processed_dates": [
+    "2026-11-26"
+  ],
+  "init": {
+    "date_sgt": "2026-11-26",
+    "method": "open_at_same_day_vault_vwap_scaled_to_100000_over_current_vault_equity",
+    "initial_capital": "100000",
+    "vault_equity_at_init": "1443076.885001",
+    "vault_positions_at_init": {
+      "BTC": "-6.30884"
+    },
+    "scale": "0.06929637709492568278709909092419070998360",
+    "note": "Virtual entry is today's vault VWAP, not the vault's historical average entry."
+  },
+  "last_run_sgt": "2026-11-26T13:47:52.871711+08:00",
+  "last_vault_equity": "1443076.885001",
+  "last_btc_mid": "60801.5",
+  "vault": "0x5661a070eb13c7c55ac3210b2447d4bea426cbf5",
+  "vault_name": "+convexity"
+}

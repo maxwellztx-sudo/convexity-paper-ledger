@@ -1,0 +1,2 @@
+date_sgt,coin,side,size,price,fee,source,vault_fill_vwap
+2026-11-26,BTC,sell,0.43718,60764,11.95,init_vault_fill_vwap,60764
