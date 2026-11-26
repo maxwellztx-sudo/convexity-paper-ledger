@@ -15,17 +15,23 @@
 ## 最新摘要
 
 <!-- LEDGER-SUMMARY:START -->
-- 更新时间（新加坡时间）：2026-11-26 13:47:52 SGT
-- 模拟权益：99,972.99 USD
-- 累计收益：-0.0270%
-- 当日盈亏：-27.01 USD
+- 更新时间（新加坡时间）：2026-11-26 14:01:37 SGT
+- 模拟权益：100,046.43 USD
+- 累计收益：+0.0464%
+- 当日盈亏：+46.43 USD
 - 模拟仓位：BTC:-0.43718
-- 模拟杠杆：0.2659x（名义价值 / 模拟权益）
-- 金库权益：1,443,076.89 USD
-- 金库仓位：BTC:-6.30884
-- BTC 中间价：60801.5
-- 当日是否跟随调仓：是
-- 当日计提资金费（计入现金）：1.33 USD
+- BTC 中间价：60633.5（当日 +3.95%，自起始日 +3.95%）
+- 今日调仓：开空 0.43718 BTC @ 60764
+
+日报全文：[2026-11-26.md](reports/2026-11-26.md) · 可复制文案：[latest_post.txt](reports/latest_post.txt)
+
+**模拟账本 vs BTC**（自 2026-11-26 起；账本刚开始，曲线较短）
+
+![+convexity 模拟账本 vs BTC](charts/pnl_vs_btc.png)
+
+**金库自身历史 vs BTC**（不是本模拟账本）
+
+![+convexity 金库自身历史 vs BTC](charts/vault_history_vs_btc.png)
 <!-- LEDGER-SUMMARY:END -->
 
 ## 模拟规则
@@ -63,7 +69,10 @@
 - `trades.csv`：每笔模拟成交（日期、币种、方向、数量、价格、手续费、来源和金库当日 VWAP）
 - `daily.csv`：每日模拟权益、仓位、杠杆、当日盈亏、累计收益，以及对照的金库权益、金库仓位和 BTC 中间价
 - `state.json`：脚本状态，用于续跑，并防止同一天重复成交
-- `update.py`：更新脚本（Python 3，只需标准库）
+- `update.py`：更新脚本（Python 3；画图需要 matplotlib，中文字体使用系统已装的 Noto Sans CJK）
+- `report_charts.py`：生成每日中文日报、可复制文案，以及收益曲线图
+- `reports/`：每日日报 `YYYY-MM-DD.md`、`latest.md`，以及可复制的 `latest_post.txt`
+- `charts/`：`pnl_vs_btc.png`（模拟账本 vs BTC，另存日期副本）和 `vault_history_vs_btc.png`（金库自身历史，不是模拟账本）
 
 每日更新命令（在已克隆本仓库的目录下）：
 

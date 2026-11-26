@@ -522,7 +522,18 @@ def git_commit_and_push(day: date, do_git: bool) -> None:
     if not do_git:
         print("skip git (--no-git)")
         return
-    git("add", "README.md", "trades.csv", "daily.csv", "state.json", "update.py", ".gitignore")
+    git(
+        "add",
+        "README.md",
+        "trades.csv",
+        "daily.csv",
+        "state.json",
+        "update.py",
+        "report_charts.py",
+        ".gitignore",
+        "reports",
+        "charts",
+    )
     status = git("status", "--porcelain", check=True)
     if not status.stdout.strip():
         # maybe an unpushed commit remains
@@ -590,6 +601,19 @@ def process(do_git: bool) -> int:
 
     if today.isoformat() in processed:
         print(f"already processed {today.isoformat()} SGT; will not trade again")
+        try:
+            mids = fetch_mids()
+            details = fetch_vault_details()
+        except ApiError as exc:
+            print(f"API failure, abort without commit: {exc}", file=sys.stderr)
+            return 1
+        try:
+            from report_charts import generate_artifacts
+            info = generate_artifacts(today, run_at, state, mids, details)
+            print(f"reports refreshed, post_len={info['post_len']}")
+        except ApiError as exc:
+            print(f"API failure, abort without commit: {exc}", file=sys.stderr)
+            return 1
         try:
             git_commit_and_push(today, do_git)
         except SystemExit as e:
@@ -796,6 +820,14 @@ def process(do_git: bool) -> int:
     print(f"btc mid: {fmt_px(btc_mid)}")
     print(f"funding today: {fmt_money(funding_today)} USD")
     print(f"traded: {traded} rows={len(trade_rows)}")
+
+    try:
+        from report_charts import generate_artifacts
+        info = generate_artifacts(today, run_at, new_state, mids, details)
+        print(f"reports written, post_len={info['post_len']}")
+    except ApiError as exc:
+        print(f"API failure after ledger write, abort without commit: {exc}", file=sys.stderr)
+        return 1
 
     try:
         git_commit_and_push(today, do_git)
