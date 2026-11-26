@@ -31,8 +31,19 @@ UTC = timezone.utc
 VAULT = "0x5661a070eb13c7c55ac3210b2447d4bea426cbf5"
 API = "https://api.hyperliquid.xyz/info"
 TAKER_FEE_RATE = Decimal("0.00045")
-START_DATE = date(2026, 11, 26)
-INITIAL_CAPITAL = Decimal("100000")
+from ledger_core import (  # noqa: E402
+    START_DATE,
+    LIVE_FROM,
+    LEDGER_VERSION,
+    NOTE_REPLAY,
+    NOTE_LIVE,
+    AUDIT_FIELDS,
+    INITIAL_CAPITAL,
+    run_ledger,
+    apply_live_day,
+    book_from_state as core_book_from_state,
+    write_csv as core_write_csv,
+)
 ROOT = Path(__file__).resolve().parent
 
 STATE_PATH = ROOT / "state.json"
@@ -49,6 +60,7 @@ TRADES_FIELDS = [
     "fee",
     "source",
     "vault_fill_vwap",
+    "note",
 ]
 DAILY_FIELDS = [
     "date_sgt",
@@ -60,7 +72,9 @@ DAILY_FIELDS = [
     "vault_equity",
     "vault_position",
     "btc_mark",
+    "note",
 ]
+AUDIT_PATH = ROOT / "replay_audit.csv"
 
 SUMMARY_START = "<!-- LEDGER-SUMMARY:START -->"
 SUMMARY_END = "<!-- LEDGER-SUMMARY:END -->"
@@ -178,6 +192,13 @@ def fetch_fills(start_ms: int, end_ms: int) -> list[dict]:
     )
     if not isinstance(data, list):
         raise ApiError("invalid userFillsByTime")
+    return data
+
+
+def fetch_ledger_updates(start_ms: int) -> list[dict]:
+    data = api_post({"type": "userNonFundingLedgerUpdates", "user": VAULT, "startTime": start_ms})
+    if not isinstance(data, list):
+        raise ApiError("invalid userNonFundingLedgerUpdates")
     return data
 
 
@@ -530,9 +551,12 @@ def git_commit_and_push(day: date, do_git: bool) -> None:
         "state.json",
         "update.py",
         "report_charts.py",
+        "ledger_core.py",
+        "replay_audit.csv",
         ".gitignore",
         "reports",
         "charts",
+        "since-2026-11-26",
     )
     status = git("status", "--porcelain", check=True)
     if not status.stdout.strip():
@@ -593,21 +617,138 @@ def build_summary(
     return "\n".join(lines) + "\n"
 
 
+
+def _persist_ledger(result: dict, details: dict, run_at: datetime, last_date: date, mid: Decimal, v_eq, v_pos) -> dict:
+    from ledger_core import AUDIT_FIELDS as _AF
+    core_write_csv(TRADES_PATH, TRADES_FIELDS, result["trades"])
+    core_write_csv(DAILY_PATH, DAILY_FIELDS, result["daily"])
+    core_write_csv(AUDIT_PATH, _AF, result["audit"])
+    book = result["book"]
+    processed = [r["date_sgt"] for r in result["daily"]]
+    state = {
+        "ledger_version": LEDGER_VERSION,
+        "initialized": True,
+        "start_date": START_DATE.isoformat(),
+        "live_from": LIVE_FROM.isoformat(),
+        "initial_capital": str(INITIAL_CAPITAL),
+        "last_date": last_date.isoformat(),
+        "last_funding_ms": book.last_funding_ms,
+        "cash": format(book.cash, "f"),
+        "positions": {
+            coin: {"szi": format(p.szi, "f"), "entry_px": format(p.entry_px, "f")}
+            for coin, p in book.positions.items()
+            if p.szi != 0
+        },
+        "processed_dates": processed,
+        "init": result.get("origin") or {},
+        "last_run_sgt": run_at.isoformat(),
+        "last_vault_equity": format(v_eq, "f") if v_eq is not None else None,
+        "last_btc_mid": fmt_px(mid),
+        "vault": VAULT,
+        "vault_name": (details or {}).get("name"),
+    }
+    write_json(STATE_PATH, state)
+    return state
+
+
 def process(do_git: bool) -> int:
     run_at = now_sgt()
     today = run_at.date()
     state = load_state()
+    needs_rebuild = (
+        state.get("ledger_version") != LEDGER_VERSION
+        or state.get("start_date") != START_DATE.isoformat()
+        or not state.get("initialized")
+    )
     processed = list(state.get("processed_dates") or [])
 
-    if today.isoformat() in processed:
+    if today < START_DATE:
+        print(f"start date is {START_DATE.isoformat()}; nothing to do")
+        return 0
+
+    try:
+        ch = fetch_clearinghouse()
+        details = fetch_vault_details()
+        mids = fetch_mids()
+        v_eq = vault_equity(ch)
+        v_pos = vault_positions(ch)
+        fetch_from = day_start_ms(START_DATE) - 36 * 3600 * 1000
+        now_ms = int(run_at.timestamp() * 1000)
+        fills = fetch_fills(fetch_from, now_ms + 60_000)
+        ledger = fetch_ledger_updates(fetch_from)
+        funding = fetch_funding("BTC", fetch_from)
+        candles = fetch_candles("BTC", fetch_from, now_ms + 3_600_000)
+    except ApiError as exc:
+        print(f"API failure, abort without commit: {exc}", file=sys.stderr)
+        return 1
+
+    fills_today = [f for f in fills if date_sgt(int(f["time"])) == today]
+    if (
+        not needs_rebuild
+        and today.isoformat() in processed
+    ):
         print(f"already processed {today.isoformat()} SGT; will not trade again")
         try:
-            mids = fetch_mids()
-            details = fetch_vault_details()
-        except ApiError as exc:
-            print(f"API failure, abort without commit: {exc}", file=sys.stderr)
-            return 1
-        try:
+            from ledger_core import apply_funding
+            mid = mids["BTC"]
+            book = core_book_from_state(state)
+            apply_funding(
+                book,
+                funding,
+                candles,
+                int(state.get("last_funding_ms") or 0),
+                now_ms,
+                mid,
+            )
+            eq = book.equity({"BTC": mid})
+            import csv as _csv
+            prev_eq = INITIAL_CAPITAL
+            existing_today = None
+            if DAILY_PATH.exists():
+                with DAILY_PATH.open(newline="", encoding="utf-8") as f:
+                    all_daily = list(_csv.DictReader(f))
+                prior = [r for r in all_daily if r.get("date_sgt", "") < today.isoformat()]
+                todays = [r for r in all_daily if r.get("date_sgt") == today.isoformat()]
+                if prior:
+                    prev_eq = d(prior[-1]["virtual_equity"].replace(",", ""))
+                if todays:
+                    existing_today = todays[-1]
+            ntl = abs(book.szi("BTC")) * mid
+            lev = (ntl / eq) if eq else Decimal("0")
+            pos_txt = (
+                existing_today["position"]
+                if existing_today and existing_today.get("position")
+                else (f"BTC:{format(book.szi('BTC'), 'f')}" if book.szi("BTC") != 0 else "FLAT")
+            )
+            daily_row = {
+                "date_sgt": today.isoformat(),
+                "virtual_equity": format(q_money(eq), "f"),
+                "position": pos_txt,
+                "leverage": format(q_lev(lev), "f"),
+                "daily_pnl": format(q_money(eq - prev_eq), "f"),
+                "cum_return": format(((eq / INITIAL_CAPITAL) - 1).quantize(Decimal("0.0000001"), rounding=ROUND_HALF_UP), "f"),
+                "vault_equity": format(q_money(v_eq), "f"),
+                "vault_position": format_position_map(v_pos),
+                "btc_mark": fmt_px(mid),
+                "note": NOTE_LIVE,
+            }
+            upsert_csv_row(DAILY_PATH, DAILY_FIELDS, "date_sgt", daily_row)
+            state = dict(state)
+            state.update(
+                {
+                    "last_funding_ms": book.last_funding_ms,
+                    "cash": format(book.cash, "f"),
+                    "positions": {
+                        coin: {"szi": format(p.szi, "f"), "entry_px": format(p.entry_px, "f")}
+                        for coin, p in book.positions.items()
+                        if p.szi != 0
+                    },
+                    "last_run_sgt": run_at.isoformat(),
+                    "last_vault_equity": format(v_eq, "f"),
+                    "last_btc_mid": fmt_px(mid),
+                }
+            )
+            write_json(STATE_PATH, state)
             from report_charts import generate_artifacts
             info = generate_artifacts(today, run_at, state, mids, details)
             print(f"reports refreshed, post_len={info['post_len']}")
@@ -620,210 +761,103 @@ def process(do_git: bool) -> int:
             return int(e.code or 2)
         return 0
 
-    try:
-        ch = fetch_clearinghouse()
-        details = fetch_vault_details()
-        mids = fetch_mids()
-        sz_decimals = fetch_sz_decimals()
-        v_eq = vault_equity(ch)
-        v_pos = vault_positions(ch)
-        fills_from = day_start_ms(START_DATE)
-        fills = fetch_fills(fills_from, int(run_at.timestamp() * 1000) + 60_000)
-    except ApiError as exc:
-        print(f"API failure, abort without commit: {exc}", file=sys.stderr)
-        return 1
-
-    fills_today_by_coin: dict[str, list[dict]] = {}
-    for f in fills:
-        if date_sgt(int(f["time"])) != today:
-            continue
-        fills_today_by_coin.setdefault(str(f["coin"]), []).append(f)
-
-    if today < START_DATE:
-        print(f"start date is {START_DATE.isoformat()}; nothing to do")
-        return 0
-
-    if today == START_DATE and not state.get("initialized") and not fills_today_by_coin:
-        print("start date has no vault fills yet; retry after the 09:45 SGT rebalance")
-        return 0
-
-    if today > START_DATE and not state.get("initialized"):
-        print("state is not initialized; refusing to invent a mid-stream snapshot", file=sys.stderr)
-        return 1
-
-    if run_at.hour < WAIT_UNTIL_HOUR_SGT and not fills_today_by_coin:
+    if run_at.hour < WAIT_UNTIL_HOUR_SGT and not fills_today and today >= LIVE_FROM and not needs_rebuild:
         print(f"{run_at.strftime('%H:%M')} SGT is before {WAIT_UNTIL_HOUR_SGT:02d}:00 and vault has not traded yet; skip")
         return 0
 
-    if v_eq <= 0:
-        print("vault equity is not positive; abort", file=sys.stderr)
-        return 1
-
-    book = book_from_state(state)
-    funding_today = Decimal("0")
-
-    # Determine the day's rebalance timestamp (first fill, else 09:45 SGT)
-    rebalance_ms = int(datetime(today.year, today.month, today.day, 9, 45, tzinfo=SGT).timestamp() * 1000)
-    if fills_today_by_coin:
-        rebalance_ms = min(int(f["time"]) for fs in fills_today_by_coin.values() for f in fs)
-
-    coins_for_funding = set(book.live_positions()) | set(v_pos) | set(fills_today_by_coin)
-    # Funding before today's rebalance, using the pre-trade book
-    pre_start = book.last_funding_ms
-    if book.last_funding_ms == 0 and not state.get("initialized"):
-        # no position yet: do not accrue funding, but set watermark just before open
-        book.last_funding_ms = rebalance_ms
-    else:
-        funding_today += apply_funding(book, coins_for_funding, pre_start, rebalance_ms, mids)
-
-    traded = False
-    trade_rows: list[dict] = []
-
-    if not state.get("initialized"):
-        # Snap to current vault leverage at today's VWAP, starting from INITIAL_CAPITAL cash.
-        # Use pre-trade equity (initial capital; cash is still initial, no position).
-        if book.live_positions():
-            print("refusing to initialize because a position already exists", file=sys.stderr)
-            return 1
-        scale = INITIAL_CAPITAL / v_eq
-        for coin, vault_szi in v_pos.items():
-            if coin not in fills_today_by_coin:
-                print(f"init skip {coin}: vault holds it but there is no same-day fill", file=sys.stderr)
-                continue
-            vwap, _net = vwap_and_net(fills_today_by_coin[coin])
-            decimals = sz_decimals.get(coin, 5)
-            target = q_size(vault_szi * scale, decimals)
-            qty = target  # from flat
-            if qty == 0:
-                continue
-            fee = q_money(abs(qty) * vwap * TAKER_FEE_RATE)
-            book.apply_trade(coin, qty, vwap, fee)
-            traded = True
-            trade_rows.append(
+    mid = mids["BTC"]
+    try:
+        if needs_rebuild:
+            print(f"rebuilding ledger from {START_DATE.isoformat()} (version {LEDGER_VERSION})")
+            result = run_ledger(
+                fills=fills,
+                ledger=ledger,
+                funding=funding,
+                candles=candles,
+                portfolio=details.get("portfolio") or [],
+                now_mid=mid,
+                now_ms=now_ms,
+                through=today,
+            )
+            # stamp today's vault equity from live clearinghouse if today is live
+            if today >= LIVE_FROM and result["daily"]:
+                result["daily"][-1]["vault_equity"] = format(q_money(v_eq), "f")
+                result["daily"][-1]["vault_position"] = format_position_map(v_pos)
+            state = _persist_ledger(result, details, run_at, today, mid, v_eq, v_pos)
+            print(f"rebuilt {len(result['trades'])} trades, {len(result['daily'])} daily rows")
+        else:
+            book = core_book_from_state(state)
+            prev_eq = INITIAL_CAPITAL
+            if DAILY_PATH.exists():
+                import csv as _csv
+                with DAILY_PATH.open(newline="", encoding="utf-8") as f:
+                    rows = list(_csv.DictReader(f))
+                prior = [r for r in rows if r.get("date_sgt", "") < today.isoformat()]
+                if prior:
+                    prev_eq = d(prior[-1]["virtual_equity"].replace(",", ""))
+            one = apply_live_day(
+                book,
+                today,
+                fills,
+                ledger,
+                funding,
+                candles,
+                details.get("portfolio") or [],
+                mid,
+                now_ms,
+                prev_eq,
+            )
+            if one["daily"]["vault_equity"] in ("", "0.00", "0"):
+                one["daily"]["vault_equity"] = format(q_money(v_eq), "f")
+                one["daily"]["vault_position"] = format_position_map(v_pos)
+            for row in one["trades"]:
+                append_trade(row)
+            upsert_csv_row(DAILY_PATH, DAILY_FIELDS, "date_sgt", one["daily"])
+            if one["audit"]:
+                # append audit row
+                from ledger_core import AUDIT_FIELDS as _AF
+                existing = []
+                if AUDIT_PATH.exists():
+                    import csv as _csv
+                    with AUDIT_PATH.open(newline="", encoding="utf-8") as f:
+                        existing = [r for r in _csv.DictReader(f) if r.get("date_sgt") != today.isoformat()]
+                existing.append(one["audit"])
+                core_write_csv(AUDIT_PATH, _AF, existing)
+            if today.isoformat() not in processed:
+                processed.append(today.isoformat())
+            book = one["book"]
+            state = dict(state)
+            state.update(
                 {
-                    "date_sgt": today.isoformat(),
-                    "coin": coin,
-                    "side": side_label(qty),
-                    "size": format(abs(qty), "f"),
-                    "price": fmt_px(vwap),
-                    "fee": format(fee, "f"),
-                    "source": "init_vault_fill_vwap",
-                    "vault_fill_vwap": fmt_px(vwap),
+                    "ledger_version": LEDGER_VERSION,
+                    "initialized": True,
+                    "last_date": today.isoformat(),
+                    "last_funding_ms": book.last_funding_ms,
+                    "cash": format(book.cash, "f"),
+                    "positions": {
+                        coin: {"szi": format(p.szi, "f"), "entry_px": format(p.entry_px, "f")}
+                        for coin, p in book.positions.items()
+                        if p.szi != 0
+                    },
+                    "processed_dates": processed,
+                    "last_run_sgt": run_at.isoformat(),
+                    "last_vault_equity": format(v_eq, "f"),
+                    "last_btc_mid": fmt_px(mid),
                 }
             )
-        if not traded:
-            print("initialization produced no trade; abort", file=sys.stderr)
+            write_json(STATE_PATH, state)
+            print(f"live day {today.isoformat()} trades={len(one['trades'])} equity={one['daily']['virtual_equity']}")
+    except Exception as exc:
+        # do not commit a half-written ledger
+        if isinstance(exc, ApiError):
+            print(f"API failure, abort without commit: {exc}", file=sys.stderr)
             return 1
-        state["initialized"] = True
-        state["init"] = {
-            "date_sgt": today.isoformat(),
-            "method": "open_at_same_day_vault_vwap_scaled_to_100000_over_current_vault_equity",
-            "initial_capital": str(INITIAL_CAPITAL),
-            "vault_equity_at_init": format(v_eq, "f"),
-            "vault_positions_at_init": {c: format(s, "f") for c, s in v_pos.items()},
-            "scale": format(scale, "f"),
-            "note": "Virtual entry is today's vault VWAP, not the vault's historical average entry.",
-        }
-    else:
-        # After funding-to-rebalance, mark and size off current equity, then trade coins the vault traded today.
-        if fills_today_by_coin:
-            eq_pre = book.equity(mids)
-            if eq_pre <= 0:
-                print("virtual equity is not positive; abort", file=sys.stderr)
-                return 1
-            scale = eq_pre / v_eq
-            # Trade only coins the vault traded today (per spec). Also close a virtual coin
-            # if the vault traded it down to flat — covered because v_pos would omit it and
-            # target becomes 0 when we still see it in fills.
-            coins_to_sync = set(fills_today_by_coin)
-            for coin in sorted(coins_to_sync):
-                vwap, _net = vwap_and_net(fills_today_by_coin[coin])
-                decimals = sz_decimals.get(coin, 5)
-                vault_szi = v_pos.get(coin, Decimal("0"))
-                target = q_size(vault_szi * scale, decimals)
-                current = book.szi(coin)
-                qty = q_size(target - current, decimals)
-                min_step = Decimal("1").scaleb(-decimals)
-                if abs(qty) < min_step:
-                    continue
-                fee = q_money(abs(qty) * vwap * TAKER_FEE_RATE)
-                book.apply_trade(coin, qty, vwap, fee)
-                traded = True
-                trade_rows.append(
-                    {
-                        "date_sgt": today.isoformat(),
-                        "coin": coin,
-                        "side": side_label(qty),
-                        "size": format(abs(qty), "f"),
-                        "price": fmt_px(vwap),
-                        "fee": format(fee, "f"),
-                        "source": "vault_fill_vwap",
-                        "vault_fill_vwap": fmt_px(vwap),
-                    }
-                )
-
-    # Funding after rebalance with the updated book, up to now
-    coins_for_funding = set(book.live_positions()) | set(v_pos)
-    funding_today += apply_funding(book, coins_for_funding, max(book.last_funding_ms, rebalance_ms), int(run_at.timestamp() * 1000), mids)
-
-    eq = book.equity(mids)
-    ntl = book.notional(mids)
-    lev = (ntl / eq) if eq != 0 else Decimal("0")
-    prev_eq = last_daily_equity()
-    # If we are writing the first row, baseline is initial capital
-    baseline = prev_eq if prev_eq is not None else INITIAL_CAPITAL
-    daily_pnl = q_money(eq - baseline)
-    cum_ret = (eq / INITIAL_CAPITAL) - 1
-    btc_mid = mids["BTC"]
-
-    daily_row = {
-        "date_sgt": today.isoformat(),
-        "virtual_equity": format(q_money(eq), "f"),
-        "position": format_position_map(book.live_positions()),
-        "leverage": format(q_lev(lev), "f"),
-        "daily_pnl": format(daily_pnl, "f"),
-        "cum_return": format(q_rate(cum_ret), "f"),
-        "vault_equity": format(q_money(v_eq), "f"),
-        "vault_position": format_position_map(v_pos),
-        "btc_mark": fmt_px(btc_mid),
-    }
-
-    summary = build_summary(today, run_at, book, mids, v_eq, v_pos, daily_pnl, cum_ret, funding_today, traded)
-
-    # Persist only after a complete successful computation
-    for row in trade_rows:
-        append_trade(row)
-    upsert_csv_row(DAILY_PATH, DAILY_FIELDS, "date_sgt", daily_row)
-    if today.isoformat() not in processed:
-        processed.append(today.isoformat())
-    new_state = state_from_book(state, book, today.isoformat())
-    new_state["initialized"] = True
-    new_state["processed_dates"] = processed
-    new_state["last_run_sgt"] = run_at.isoformat()
-    new_state["last_vault_equity"] = format(v_eq, "f")
-    new_state["last_btc_mid"] = fmt_px(btc_mid)
-    new_state["vault"] = VAULT
-    new_state["vault_name"] = details.get("name")
-    if "init" in state:
-        new_state["init"] = state["init"]
-    write_json(STATE_PATH, new_state)
-    replace_readme_summary(summary)
-
-    print(f"date: {today.isoformat()} SGT")
-    print(f"virtual equity: {fmt_money(eq)} USD")
-    print(f"position: {daily_row['position']}")
-    print(f"leverage: {daily_row['leverage']}x")
-    print(f"daily pnl: {daily_row['daily_pnl']}")
-    print(f"cum return: {daily_row['cum_return']}")
-    print(f"vault equity: {fmt_money(v_eq)} USD")
-    print(f"vault position: {daily_row['vault_position']}")
-    print(f"btc mid: {fmt_px(btc_mid)}")
-    print(f"funding today: {fmt_money(funding_today)} USD")
-    print(f"traded: {traded} rows={len(trade_rows)}")
+        print(f"ledger build failed, abort without commit: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
 
     try:
         from report_charts import generate_artifacts
-        info = generate_artifacts(today, run_at, new_state, mids, details)
+        info = generate_artifacts(today, run_at, state, mids, details)
         print(f"reports written, post_len={info['post_len']}")
     except ApiError as exc:
         print(f"API failure after ledger write, abort without commit: {exc}", file=sys.stderr)

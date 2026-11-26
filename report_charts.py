@@ -6,7 +6,7 @@ from __future__ import annotations
 import csv
 import math
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,7 @@ from update import (
     START_DATE,
     TRADES_PATH,
     VAULT,
+    LIVE_FROM,
     ApiError,
     Book,
     Position,
@@ -47,6 +48,37 @@ CJK_REGULAR = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 CJK_BOLD = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
 
 POST_LIMIT = 270
+
+def max_drawdown(rows: list[dict[str, str]]) -> tuple[Decimal, str, str] | None:
+    if not rows:
+        return None
+    peak = d(rows[0]["virtual_equity"])
+    peak_date = rows[0]["date_sgt"]
+    trough_date = peak_date
+    maxdd = Decimal("0")
+    for r in rows:
+        e = d(r["virtual_equity"])
+        if e > peak:
+            peak = e
+            peak_date = r["date_sgt"]
+        if peak != 0:
+            dd = (e - peak) / peak
+            if dd < maxdd:
+                maxdd = dd
+                trough_date = r["date_sgt"]
+    return maxdd, peak_date, trough_date
+
+
+
+def fmt_mark(x: Decimal) -> str:
+    """Display price quantized to 0.1 (HL BTC tick), trailing zeros stripped."""
+    v = x.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    s = format(v, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+
 
 
 def ensure_dirs() -> None:
@@ -399,7 +431,7 @@ def fmt_pos_lines(positions: dict[str, dict], mid: Decimal, equity: Decimal) -> 
         notional = abs(szi) * px
         lev = (notional / equity) if equity != 0 else Decimal("0")
         lines.append(
-            f"{coin} {direction} {fmt_px(abs(szi))}，开仓均价 {fmt_px(entry)}，"
+            f"{coin} {direction} {fmt_px(abs(szi))}，开仓均价 {fmt_mark(entry)}，"
             f"名义 {fmt_money(notional)} USD，杠杆 {fmt_px(q_lev(lev))}x"
         )
     return lines or ["当前空仓。"]
@@ -421,7 +453,7 @@ def fmt_today_trades(trades: list[dict[str, str]], day: date) -> str:
         qty = trade_qty(r)
         label = action_cn(old, qty)
         running[coin] = old + qty
-        parts.append(f"{label} {fmt_px(abs(qty))} {coin} @ {r['price']}")
+        parts.append(f"{label} {fmt_px(abs(qty))} {coin} @ {fmt_mark(d(r['price']))}")
     return "；".join(parts)
 
 
@@ -461,10 +493,19 @@ def build_report_md(
         f"- 累计 PnL：{signed_money(cum_pnl)} USD",
         f"- 累计收益率：{signed_pct(cum_ret, 4)}",
         f"- 模拟权益：{fmt_money(equity)} USD",
+        *(
+            [
+                f"- 最大回撤（按每日权益）：{signed_pct(dd[0], 2)}（高点 {dd[1]}，低点 {dd[2]}）"
+            ]
+            if (dd := max_drawdown(read_csv(DAILY_PATH)))
+            else []
+        ),
         "",
         "## BTC",
         f"- 近24h：{fmt_px(mid)}，较 {dt_24h.strftime('%m-%d %H:%M')} SGT 的 {fmt_px(px_24h)} 为 {signed_pct(btc_24h, 2)}",
         f"- 自起始日（首次模拟成交 {fill_dt.strftime('%Y-%m-%d %H:%M')} SGT @ {fmt_px(fill_px)}）：{signed_pct(btc_since_start, 2)}",
+        "",
+        "说明：2026-11-19 至 2026-11-25 为回溯重放，非实时；2026-11-26 起为实时记账。已剔除出入金驱动的补仓。",
         "",
         f"账本：{REPO_URL}",
         f"金库地址：`{VAULT}`（可公开核对）",
@@ -498,13 +539,14 @@ def build_post(
             notional = abs(szi) * mid
             lev = (notional / equity) if equity != 0 else Decimal("0")
             bits.append(
-                f"{coin}{direction} {fmt_px(abs(szi))}，均价 {fmt_px(entry)}，杠杆 {fmt_px(q_lev(lev))}x"
+                f"{coin}{direction} {fmt_px(abs(szi))}，均价 {fmt_mark(entry)}，杠杆 {fmt_px(q_lev(lev))}x"
             )
         pos_txt = "；".join(bits) if bits else "空仓"
     else:
         pos_txt = "空仓"
 
     btc_line = f"BTC近24h {signed_pct(btc_24h, 2)}（自起始日 {signed_pct(btc_since_start, 2)}）"
+    replay_line = "11-19至11-25为回溯重放，非实时。"
 
     candidates = [
         "\n".join(
@@ -516,6 +558,7 @@ def build_post(
                 f"权益：{fmt_money(equity)} USD",
                 btc_line,
                 f"账本：{REPO_URL}",
+                replay_line,
                 "免责：模拟账户，非投资建议。",
             ]
         ),
@@ -528,7 +571,19 @@ def build_post(
                 f"权益：{fmt_money(equity)} USD",
                 btc_line,
                 f"{REPO_URL}",
+                replay_line,
                 "模拟账户，非投资建议。",
+            ]
+        ),
+        "\n".join(
+            [
+                f"+convexity 模拟账本 {day.isoformat()}",
+                f"持仓：{pos_txt}",
+                f"今日调仓：{today_trades}",
+                f"今日PnL：{signed_money(daily_pnl)}，累计 {signed_pct(cum_ret, 2)}，权益 {fmt_money(equity)}",
+                btc_line,
+                replay_line,
+                f"{REPO_URL}",
             ]
         ),
     ]
@@ -566,8 +621,8 @@ def plot_paper_vs_btc(
 
     fp, fpb = _font(False), _font(True)
     fig = plt.figure(figsize=(10.8, 13.5), dpi=100, facecolor="#FAF7F2")
-    ax = fig.add_axes([0.14, 0.16, 0.80, 0.68])
-    ax.set_facecolor("#FFFdf8")
+    ax = fig.add_axes([0.14, 0.16, 0.80, 0.66])
+    ax.set_facecolor("#FFFFFF")
 
     xs = [p["dt"] for p in curve]
     y_paper = [float(p["ret"] * 100) for p in curve]
@@ -591,6 +646,24 @@ def plot_paper_vs_btc(
                 color="#B3261E",
             )
 
+    # shade the backfill window (up to the first live rebalance)
+    from datetime import datetime as _dt
+    live_start = _dt(LIVE_FROM.year, LIVE_FROM.month, LIVE_FROM.day, 9, 45, tzinfo=SGT)
+    if xs and xs[0] < live_start:
+        ax.axvspan(xs[0], min(live_start, xs[-1]), color="#E8DFC8", alpha=1.0, lw=0, zorder=0)
+    if xs and xs[0] < live_start < xs[-1]:
+        ax.axvline(live_start, color="#8A6A3C", lw=1.0, ls="--", zorder=2)
+        ax.text(
+            live_start,
+            0.02,
+            " 实时起点",
+            transform=ax.get_xaxis_transform(),
+            fontproperties=fp,
+            fontsize=10,
+            color="#8A6A3C",
+            va="bottom",
+            ha="left",
+        )
     ax.axhline(0, color="#888888", lw=0.8, ls="--")
     ax.set_ylabel("累计涨跌（%）", fontproperties=fp, fontsize=15)
     ax.set_xlabel("新加坡时间", fontproperties=fp, fontsize=15)
@@ -619,12 +692,20 @@ def plot_paper_vs_btc(
     fig.text(
         0.50,
         0.905,
-        f"自首次模拟成交 {origin['dt'].strftime('%Y-%m-%d %H:%M')} SGT @ {fmt_px(origin['px'])} 起"
-        f"（该时点两条曲线均为 0）· 截至 {last['dt'].strftime('%Y-%m-%d %H:%M')} SGT",
+        f"自首次模拟成交 {origin['dt'].strftime('%Y-%m-%d %H:%M')} SGT @ {fmt_px(origin['px'])} 起（该时点两条曲线均为 0）",
         ha="center",
         fontproperties=fp,
         fontsize=13,
         color="#444444",
+    )
+    fig.text(
+        0.50,
+        0.875,
+        "阴影段 11-19 至 11-25 为回溯重放，非实时；11-26 起为实时记账",
+        ha="center",
+        fontproperties=fpb,
+        fontsize=12,
+        color="#8B1E1E",
     )
     fig.text(
         0.50,
@@ -664,7 +745,7 @@ def plot_vault_history(
     fp, fpb = _font(False), _font(True)
     fig = plt.figure(figsize=(10.8, 13.5), dpi=100, facecolor="#FAF7F2")
     ax = fig.add_axes([0.14, 0.18, 0.80, 0.61])
-    ax.set_facecolor("#FFFdf8")
+    ax.set_facecolor("#FFFFFF")
 
     t0 = twr_points[0][0]
     # BTC baseline: last daily close at or before first vault point
@@ -844,7 +925,7 @@ def generate_artifacts(
 
     cum_pnl = equity - INITIAL_CAPITAL
     cum_ret = (equity / INITIAL_CAPITAL) - 1
-    daily_pnl = equity - previous_report_equity(day)
+    daily_pnl = equity - previous_equity(daily_rows, day)
     today_trades = fmt_today_trades(trades, day)
     positions = state.get("positions") or {}
 
@@ -905,13 +986,9 @@ def generate_artifacts(
             "",
             f"日报全文：[{dated_md.as_posix().split('/')[-1]}](reports/{day.isoformat()}.md) · 可复制文案：[latest_post.txt](reports/latest_post.txt)",
             "",
-            f"**模拟账本 vs BTC**（自首次模拟成交 {fill_dt.strftime('%Y-%m-%d %H:%M')} SGT @ {fmt_px(fill_px)} 起，该时点两条曲线为 0；账本刚开始，曲线较短）",
+            f"**模拟账本 vs BTC**（自首次模拟成交 {fill_dt.strftime('%Y-%m-%d %H:%M')} SGT @ {fmt_px(fill_px)} 起，该时点两条曲线为 0；11-19 至 11-25 为回溯重放，非实时）",
             "",
             "![+convexity 模拟账本 vs BTC](charts/pnl_vs_btc.png)",
-            "",
-            "**金库自身历史 vs BTC**（不是本模拟账本）",
-            "",
-            "![+convexity 金库自身历史 vs BTC](charts/vault_history_vs_btc.png)",
             "",
         ]
     )

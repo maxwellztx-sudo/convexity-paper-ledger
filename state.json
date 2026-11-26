@@ -1,33 +1,44 @@
 {
+  "ledger_version": "week_replay_2026-11-19",
   "initialized": true,
-  "start_date": "2026-11-26",
+  "start_date": "2026-11-19",
+  "live_from": "2026-11-26",
   "initial_capital": "100000",
   "last_date": "2026-11-26",
-  "last_funding_ms": 1795669200025,
-  "cash": "99989.3794151972500",
+  "last_funding_ms": 1795676400035,
+  "cash": "101650.7919835388206474964239992300030921",
   "positions": {
     "BTC": {
-      "szi": "-0.43718",
-      "entry_px": "60764.0"
+      "szi": "-0.46059",
+      "entry_px": "61341.27273472284193426599796081112683265"
     }
   },
   "processed_dates": [
+    "2026-11-19",
+    "2026-11-20",
+    "2026-11-21",
+    "2026-11-22",
+    "2026-11-23",
+    "2026-11-24",
+    "2026-11-25",
     "2026-11-26"
   ],
   "init": {
-    "date_sgt": "2026-11-26",
-    "method": "open_at_same_day_vault_vwap_scaled_to_100000_over_current_vault_equity",
-    "initial_capital": "100000",
-    "vault_equity_at_init": "1443076.885001",
-    "vault_positions_at_init": {
-      "BTC": "-6.30884"
-    },
-    "scale": "0.06929637709492568278709909092419070998360",
-    "note": "Virtual entry is today's vault VWAP, not the vault's historical average entry."
+    "date_sgt": "2026-11-19",
+    "time_sgt": "2026-11-19T09:45:58.270000+08:00",
+    "vault_szi_before": "-5.73308",
+    "vault_equity_pre": "1224988.069140798688888888888888888888889",
+    "equity_anchor_ms": 1795029873616,
+    "equity_anchor": "1132781.273752",
+    "price": "62752",
+    "virtual_szi": "-0.46801",
+    "fee": "13.22",
+    "method": "pre_rebalance_vault_position_scaled_to_100000_over_E_pre_at_11-19_vwap_62752",
+    "note": "回溯重放，非实时"
   },
-  "last_run_sgt": "2026-11-26T13:47:52.871711+08:00",
-  "last_vault_equity": "1443076.885001",
-  "last_btc_mid": "60801.5",
+  "last_run_sgt": "2026-11-26T15:45:49.355053+08:00",
+  "last_vault_equity": "1447980.5123129999",
+  "last_btc_mid": "60593.5",
   "vault": "0x5661a070eb13c7c55ac3210b2447d4bea426cbf5",
   "vault_name": "+convexity"
 }

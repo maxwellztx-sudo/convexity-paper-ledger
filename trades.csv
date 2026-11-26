@@ -1,2 +1,10 @@
-date_sgt,coin,side,size,price,fee,source,vault_fill_vwap
-2026-11-26,BTC,sell,0.43718,60764,11.95,init_vault_fill_vwap,60764
+date_sgt,coin,side,size,price,fee,source,vault_fill_vwap,note
+2026-11-19,BTC,sell,0.46801,62752,13.22,replay_init,62752,回溯重放，非实时
+2026-11-19,BTC,sell,0.17005,62752,4.80,replay_strategy,62752,回溯重放，非实时
+2026-11-20,BTC,sell,0.46683,62010,13.03,replay_strategy,62010,回溯重放，非实时
+2026-11-21,BTC,sell,0.16078,58964,4.27,replay_strategy,58964,回溯重放，非实时
+2026-11-22,BTC,buy,0.20510,60058,5.54,replay_strategy,60058,回溯重放，非实时
+2026-11-23,BTC,buy,0.90784,60957.3591026528,24.90,replay_strategy,60957.3591026528,回溯重放，非实时
+2026-11-24,BTC,sell,0.30479,61472.5071973228,8.43,replay_strategy,61472.5071973228,回溯重放，非实时
+2026-11-25,BTC,buy,0.15662,59252,4.18,replay_strategy,59252,回溯重放，非实时
+2026-11-26,BTC,sell,0.15969,60764,4.37,live_strategy,60764,实时
