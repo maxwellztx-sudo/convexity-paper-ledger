@@ -41,6 +41,7 @@ from update import (
 REPO_URL = "https://github.com/maxwellztx-sudo/convexity-paper-ledger"
 REPORTS_DIR = ROOT / "reports"
 CHARTS_DIR = ROOT / "charts"
+EQUITY_HISTORY_PATH = REPORTS_DIR / "equity_history.csv"
 
 CJK_REGULAR = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 CJK_BOLD = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
@@ -160,31 +161,38 @@ def reconstruct_hourly(
     now_ms: int,
     now_mid: Decimal,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Walk recorded trades + hourly funding/marks. Returns (curve points, trade marks)."""
-    start_ms = day_start_ms(START_DATE)
+    """Walk recorded trades + hourly funding/marks.
+
+    The curve starts at the first virtual fill. Both paper and BTC returns
+    are zero at that instant (paper is shifted by post-fee equity / 100,000).
+    """
     trade_events = attach_trade_times(trades, fills)
+    if not trade_events:
+        raise ApiError("no recorded virtual trades to anchor the chart")
+    origin_ts, origin_row = trade_events[0]
+    origin_px = d(origin_row["price"])
     book = Book()
     price_at = candle_price_fn(btc_candles, now_mid)
 
-    times: set[int] = {start_ms, now_ms}
+    times: set[int] = {origin_ts, now_ms}
     for c in btc_candles:
         t = int(c["t"])
-        if start_ms <= t <= now_ms:
+        if origin_ts <= t <= now_ms:
             times.add(t)
         end = t + 3_600_000
-        if start_ms <= end <= now_ms:
+        if origin_ts <= end <= now_ms:
             times.add(end)
     for ts, _ in trade_events:
-        if start_ms <= ts <= now_ms:
+        if origin_ts <= ts <= now_ms:
             times.add(ts)
     for ev in funding_events:
         ts = int(ev["time"])
-        if start_ms <= ts <= now_ms:
+        if origin_ts <= ts <= now_ms:
             times.add(ts)
 
     pending_trades = list(trade_events)
     pending_fund = sorted(
-        [ev for ev in funding_events if start_ms < int(ev["time"]) <= now_ms],
+        [ev for ev in funding_events if origin_ts < int(ev["time"]) <= now_ms],
         key=lambda ev: int(ev["time"]),
     )
     # running position before each trade, for labels
@@ -200,20 +208,20 @@ def reconstruct_hourly(
     applied_trade_ids: set[int] = set()
     applied_fund: set[int] = set()
 
+    eq_origin: Decimal | None = None
+
     def snapshot(ts: int, mid_override: Decimal | None = None) -> dict[str, Any]:
         px = mid_override if mid_override is not None else (now_mid if ts >= now_ms else price_at(ts))
-        mids = {"BTC": px}
-        # if other coins appear later, fall back to leaving only BTC marked; equity uses available mids
         eq = book.cash
         for coin, p in book.positions.items():
             if p.szi == 0:
                 continue
-            if coin == "BTC":
-                eq += p.szi * (px - p.entry_px)
-            elif coin in mids:
-                eq += p.szi * (mids[coin] - p.entry_px)
-        ret = (eq / INITIAL_CAPITAL) - 1
-        btc_ret = (px / price_at(start_ms)) - 1 if price_at(start_ms) != 0 else Decimal("0")
+            mark = px if coin == "BTC" else mid_override
+            if mark is None:
+                continue
+            eq += p.szi * (mark - p.entry_px)
+        ret = Decimal("0") if eq_origin is None else (eq - eq_origin) / INITIAL_CAPITAL
+        btc_ret = (px / origin_px) - 1 if origin_px != 0 else Decimal("0")
         return {
             "ts": ts,
             "dt": datetime.fromtimestamp(ts / 1000, tz=SGT),
@@ -223,11 +231,8 @@ def reconstruct_hourly(
             "btc_ret": btc_ret,
         }
 
-    # opening point, flat
-    curve.append(snapshot(start_ms, price_at(start_ms)))
-
     for ts in sorted(times):
-        if ts < start_ms or ts > now_ms:
+        if ts < origin_ts or ts > now_ms:
             continue
         # apply trades at this timestamp
         for ev_ts, row in pending_trades:
@@ -240,6 +245,14 @@ def reconstruct_hourly(
             old = book.szi(row["coin"])
             book.apply_trade(row["coin"], qty, px, fee)
             applied_trade_ids.add(rid)
+            if eq_origin is None:
+                # post-fee, marked at the fill price so unrealized is 0
+                eq_origin = book.cash
+                for coin, p in book.positions.items():
+                    if p.szi == 0:
+                        continue
+                    mark = px if coin == row["coin"] else price_at(ts)
+                    eq_origin += p.szi * (mark - p.entry_px)
             pt = snapshot(ts, px if row["coin"] == "BTC" else None)
             label = action_cn(old, qty)
             marks.append({**pt, "label": label, "qty": qty, "coin": row["coin"], "price": px})
@@ -249,7 +262,7 @@ def reconstruct_hourly(
             ev_ts = int(ev["time"])
             if ev_ts in applied_fund or ev_ts > ts:
                 continue
-            if ev_ts <= start_ms:
+            if ev_ts <= origin_ts:
                 applied_fund.add(ev_ts)
                 continue
             coin = str(ev.get("coin") or "BTC")
@@ -261,7 +274,7 @@ def reconstruct_hourly(
             mark = price_at(hour)
             book.cash += -book.szi(coin) * mark * rate
             applied_fund.add(ev_ts)
-        if ts == start_ms:
+        if eq_origin is None:
             continue
         px_override = now_mid if ts == now_ms else None
         pt = snapshot(ts, px_override)
@@ -270,7 +283,13 @@ def reconstruct_hourly(
         else:
             curve.append(pt)
 
-    return curve, marks
+    origin = {
+        "ts": origin_ts,
+        "dt": datetime.fromtimestamp(origin_ts / 1000, tz=SGT),
+        "px": origin_px,
+        "equity": eq_origin,
+    }
+    return curve, marks, origin
 
 
 def vault_twr_series(portfolio: list) -> tuple[list[tuple[int, Decimal, Decimal, Decimal]], str]:
@@ -416,10 +435,12 @@ def build_report_md(
     cum_ret: Decimal,
     mid: Decimal,
     today_trades: str,
-    btc_today: Decimal,
+    btc_24h: Decimal,
     btc_since_start: Decimal,
-    today_open: Decimal,
-    start_open: Decimal,
+    px_24h: Decimal,
+    dt_24h: datetime,
+    fill_px: Decimal,
+    fill_dt: datetime,
 ) -> str:
     pos_lines = fmt_pos_lines(positions, mid, equity)
     pos_block = "\n".join(f"- {x}" for x in pos_lines)
@@ -442,8 +463,8 @@ def build_report_md(
         f"- 模拟权益：{fmt_money(equity)} USD",
         "",
         "## BTC",
-        f"- 当日：{fmt_px(mid)}，较今日 00:00 开盘 {fmt_px(today_open)} 为 {signed_pct(btc_today, 2)}",
-        f"- 自账本起始日（{START_DATE.isoformat()} 00:00 开盘 {fmt_px(start_open)}）：{signed_pct(btc_since_start, 2)}",
+        f"- 近24h：{fmt_px(mid)}，较 {dt_24h.strftime('%m-%d %H:%M')} SGT 的 {fmt_px(px_24h)} 为 {signed_pct(btc_24h, 2)}",
+        f"- 自起始日（首次模拟成交 {fill_dt.strftime('%Y-%m-%d %H:%M')} SGT @ {fmt_px(fill_px)}）：{signed_pct(btc_since_start, 2)}",
         "",
         f"账本：{REPO_URL}",
         f"金库地址：`{VAULT}`（可公开核对）",
@@ -463,7 +484,7 @@ def build_post(
     cum_ret: Decimal,
     mid: Decimal,
     today_trades: str,
-    btc_today: Decimal,
+    btc_24h: Decimal,
     btc_since_start: Decimal,
 ) -> str:
     if positions:
@@ -483,12 +504,7 @@ def build_post(
     else:
         pos_txt = "空仓"
 
-    btc_line = f"BTC今日 {signed_pct(btc_today, 2)}"
-    if day != START_DATE:
-        btc_line += f"（自起始日 {signed_pct(btc_since_start, 2)}）"
-    else:
-        # same window on day 1 — still mention 起始日 so the template is stable
-        btc_line += f"（自起始日 {signed_pct(btc_since_start, 2)}）"
+    btc_line = f"BTC近24h {signed_pct(btc_24h, 2)}（自起始日 {signed_pct(btc_since_start, 2)}）"
 
     candidates = [
         "\n".join(
@@ -536,7 +552,12 @@ def _apply_tick_font(ax, fp) -> None:
         lab.set_fontproperties(fp)
 
 
-def plot_paper_vs_btc(curve: list[dict[str, Any]], marks: list[dict[str, Any]], dests: list[Path]) -> None:
+def plot_paper_vs_btc(
+    curve: list[dict[str, Any]],
+    marks: list[dict[str, Any]],
+    dests: list[Path],
+    origin: dict[str, Any],
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -598,7 +619,8 @@ def plot_paper_vs_btc(curve: list[dict[str, Any]], marks: list[dict[str, Any]], 
     fig.text(
         0.50,
         0.905,
-        f"自 {START_DATE.isoformat()} 起（账本起始日，曲线尚短）· 数据截至 {last['dt'].strftime('%Y-%m-%d %H:%M')} SGT",
+        f"自首次模拟成交 {origin['dt'].strftime('%Y-%m-%d %H:%M')} SGT @ {fmt_px(origin['px'])} 起"
+        f"（该时点两条曲线均为 0）· 截至 {last['dt'].strftime('%Y-%m-%d %H:%M')} SGT",
         ha="center",
         fontproperties=fp,
         fontsize=13,
@@ -641,7 +663,7 @@ def plot_vault_history(
 
     fp, fpb = _font(False), _font(True)
     fig = plt.figure(figsize=(10.8, 13.5), dpi=100, facecolor="#FAF7F2")
-    ax = fig.add_axes([0.14, 0.18, 0.80, 0.66])
+    ax = fig.add_axes([0.14, 0.18, 0.80, 0.61])
     ax.set_facecolor("#FFFdf8")
 
     t0 = twr_points[0][0]
@@ -666,7 +688,6 @@ def plot_vault_history(
     ax.plot(v_x, v_y, color="#1F4E79", lw=2.8, marker="o", ms=3.5, label="金库时间加权收益")
 
     ax.axhline(0, color="#888888", lw=0.8, ls="--")
-    ax.set_title("+convexity 金库自身历史 vs BTC", fontproperties=fpb, fontsize=24, pad=14, color="#1A1A1A")
     ax.set_ylabel("累计涨跌（%）", fontproperties=fp, fontsize=15)
     ax.set_xlabel("新加坡时间", fontproperties=fp, fontsize=15)
     ax.grid(True, color="#E2D9CC", lw=0.8)
@@ -689,21 +710,30 @@ def plot_vault_history(
 
     fig.text(
         0.50,
-        0.905,
-        "此图是金库自身的公开历史，不是本仓库的模拟账本",
+        0.955,
+        "+convexity 金库自身历史 vs BTC",
         ha="center",
         fontproperties=fpb,
-        fontsize=15,
-        color="#8B1E1E",
+        fontsize=24,
+        color="#1A1A1A",
     )
     fig.text(
         0.50,
-        0.875,
+        0.918,
         f"区间自 {start_dt} 起（首次有权益的公开快照）",
         ha="center",
         fontproperties=fp,
-        fontsize=12,
+        fontsize=13,
         color="#444444",
+    )
+    fig.text(
+        0.50,
+        0.882,
+        "此图是金库自身的公开历史，不是本仓库的模拟账本",
+        ha="center",
+        fontproperties=fpb,
+        fontsize=14,
+        color="#8B1E1E",
     )
     fig.text(
         0.50,
@@ -735,6 +765,38 @@ def previous_equity(daily_rows: list[dict[str, str]], day: date) -> Decimal:
     return d(prior[-1]["virtual_equity"].replace(",", ""))
 
 
+def load_equity_history() -> list[dict[str, str]]:
+    return read_csv(EQUITY_HISTORY_PATH)
+
+
+def previous_report_equity(day: date) -> Decimal:
+    """Yesterday's last published report equity; first day baselines at 100,000."""
+    prior = [r for r in load_equity_history() if r.get("date_sgt", "") < day.isoformat()]
+    if not prior:
+        return INITIAL_CAPITAL
+    return d(prior[-1]["equity"].replace(",", ""))
+
+
+def upsert_equity_history(day: date, equity: Decimal, run_at: datetime) -> None:
+    ensure_dirs()
+    rows = [r for r in load_equity_history() if r.get("date_sgt") != day.isoformat()]
+    rows.append(
+        {
+            "date_sgt": day.isoformat(),
+            "equity": format(q_money(equity), "f"),
+            "run_at_sgt": run_at.isoformat(),
+        }
+    )
+    rows.sort(key=lambda r: r["date_sgt"])
+    tmp = EQUITY_HISTORY_PATH.with_suffix(".csv.tmp")
+    import csv as _csv
+    with tmp.open("w", newline="", encoding="utf-8") as f:
+        writer = _csv.DictWriter(f, fieldnames=["date_sgt", "equity", "run_at_sgt"])
+        writer.writeheader()
+        writer.writerows(rows)
+    tmp.replace(EQUITY_HISTORY_PATH)
+
+
 def generate_artifacts(
     day: date,
     run_at: datetime,
@@ -749,20 +811,27 @@ def generate_artifacts(
     mid = mids["BTC"]
     now_ms = int(run_at.timestamp() * 1000)
     start_ms = day_start_ms(START_DATE)
-    today_ms = day_start_ms(day)
 
     fills = fetch_fills(start_ms, now_ms + 60_000)
-    btc_hourly = fetch_candles("BTC", start_ms, now_ms + 3_600_000)
+    lookback_ms = now_ms - 26 * 3_600_000
+    btc_hourly = fetch_candles("BTC", min(start_ms, lookback_ms), now_ms + 3_600_000)
     if not btc_hourly:
         raise ApiError("no BTC hourly candles for the ledger window")
     funding = fetch_funding("BTC", start_ms - 3_600_000)
 
-    # BTC opens
+    trade_events = attach_trade_times(trades, fills)
+    if not trade_events:
+        raise ApiError("no recorded virtual trades to anchor BTC since-start")
+    fill_ts, fill_row = trade_events[0]
+    fill_px = d(fill_row["price"])
+    fill_dt = datetime.fromtimestamp(fill_ts / 1000, tz=SGT)
+
     price_at = candle_price_fn(btc_hourly, mid)
-    start_open = price_at(start_ms)
-    today_open = price_at(today_ms)
-    btc_today = (mid / today_open) - 1 if today_open else Decimal("0")
-    btc_since = (mid / start_open) - 1 if start_open else Decimal("0")
+    ts_24h = now_ms - 86_400_000
+    dt_24h = datetime.fromtimestamp(ts_24h / 1000, tz=SGT)
+    px_24h = price_at(ts_24h).quantize(Decimal("0.1"))
+    btc_24h = (mid / px_24h) - 1 if px_24h else Decimal("0")
+    btc_since = (mid / fill_px) - 1 if fill_px else Decimal("0")
 
     book = Book()
     book.cash = d(state.get("cash", INITIAL_CAPITAL))
@@ -775,7 +844,7 @@ def generate_artifacts(
 
     cum_pnl = equity - INITIAL_CAPITAL
     cum_ret = (equity / INITIAL_CAPITAL) - 1
-    daily_pnl = equity - previous_equity(daily_rows, day)
+    daily_pnl = equity - previous_report_equity(day)
     today_trades = fmt_today_trades(trades, day)
     positions = state.get("positions") or {}
 
@@ -789,13 +858,15 @@ def generate_artifacts(
         cum_ret,
         mid,
         today_trades,
-        btc_today,
+        btc_24h,
         btc_since,
-        today_open,
-        start_open,
+        px_24h,
+        dt_24h,
+        fill_px,
+        fill_dt,
     )
     post = build_post(
-        day, positions, equity, daily_pnl, cum_pnl, cum_ret, mid, today_trades, btc_today, btc_since
+        day, positions, equity, daily_pnl, cum_pnl, cum_ret, mid, today_trades, btc_24h, btc_since
     )
     dated_md = REPORTS_DIR / f"{day.isoformat()}.md"
     latest_md = REPORTS_DIR / "latest.md"
@@ -803,13 +874,14 @@ def generate_artifacts(
     dated_md.write_text(md, encoding="utf-8")
     latest_md.write_text(md, encoding="utf-8")
     post_path.write_text(post if post.endswith("\n") else post + "\n", encoding="utf-8")
+    upsert_equity_history(day, equity, run_at)
 
-    curve, marks = reconstruct_hourly(trades, fills, btc_hourly, funding, now_ms, mid)
+    curve, marks, origin = reconstruct_hourly(trades, fills, btc_hourly, funding, now_ms, mid)
     if not curve:
         raise ApiError("empty paper equity curve")
     paper_png = CHARTS_DIR / "pnl_vs_btc.png"
     dated_png = CHARTS_DIR / f"{day.isoformat()}.png"
-    plot_paper_vs_btc(curve, marks, [paper_png, dated_png])
+    plot_paper_vs_btc(curve, marks, [paper_png, dated_png], origin)
 
     twr_points, method_note = vault_twr_series(vault_details.get("portfolio") or [])
     first_ts = twr_points[0][0]
@@ -828,12 +900,12 @@ def generate_artifacts(
             f"- 累计收益：{signed_pct(cum_ret, 4)}",
             f"- 当日盈亏：{signed_money(daily_pnl)} USD",
             f"- 模拟仓位：{today_trades if False else _pos_short(positions)}",
-            f"- BTC 中间价：{fmt_px(mid)}（当日 {signed_pct(btc_today, 2)}，自起始日 {signed_pct(btc_since, 2)}）",
+            f"- BTC 中间价：{fmt_px(mid)}（近24h {signed_pct(btc_24h, 2)}，自起始日 {signed_pct(btc_since, 2)}）",
             f"- 今日调仓：{today_trades}",
             "",
             f"日报全文：[{dated_md.as_posix().split('/')[-1]}](reports/{day.isoformat()}.md) · 可复制文案：[latest_post.txt](reports/latest_post.txt)",
             "",
-            f"**模拟账本 vs BTC**（自 {START_DATE.isoformat()} 起；账本刚开始，曲线较短）",
+            f"**模拟账本 vs BTC**（自首次模拟成交 {fill_dt.strftime('%Y-%m-%d %H:%M')} SGT @ {fmt_px(fill_px)} 起，该时点两条曲线为 0；账本刚开始，曲线较短）",
             "",
             "![+convexity 模拟账本 vs BTC](charts/pnl_vs_btc.png)",
             "",
