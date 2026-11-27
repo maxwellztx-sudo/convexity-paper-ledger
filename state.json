@@ -37,9 +37,9 @@
     "method": "pre_rebalance_vault_position_scaled_to_100000_over_E_pre_at_11-19_vwap_62752",
     "note": "回溯重放，非实时"
   },
-  "last_run_sgt": "2026-11-27T10:31:44.706348+08:00",
-  "last_vault_equity": "1456386.286361",
-  "last_btc_mid": "61568.5",
+  "last_run_sgt": "2026-11-27T10:37:23.065566+08:00",
+  "last_vault_equity": "1456354.4104909999",
+  "last_btc_mid": "61646.5",
   "vault": "0x5661a070eb13c7c55ac3210b2447d4bea426cbf5",
   "vault_name": "+convexity"
 }
