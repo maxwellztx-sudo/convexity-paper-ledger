@@ -9,3 +9,4 @@ date_sgt,coin,side,size,price,fee,source,vault_fill_vwap,note
 2026-11-25,BTC,buy,0.15662,59252,4.18,replay_strategy,59252,回溯重放，非实时
 2026-11-26,BTC,sell,0.15969,60764,4.37,live_strategy,60764,实时
 2026-11-27,BTC,buy,0.44842,60676,12.24,live_strategy,60676,实时
+2026-11-28,BTC,sell,0.23128,60152,6.26,live_strategy,60152,实时
